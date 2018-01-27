@@ -1,0 +1,609 @@
+package cn.iever.wxh.yjserver.server.communicate;
+
+import java.io.UnsupportedEncodingException;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Scanner;
+
+import org.apache.log4j.Logger;
+import org.apache.mina.core.session.IoSession;
+
+import cn.iever.wxh.yjserver.core.dbAPI.IDeviceServiceAPI;
+import cn.iever.wxh.yjserver.core.model.Authorization;
+import cn.iever.wxh.yjserver.core.model.DeviceVo;
+import cn.iever.wxh.yjserver.core.model.STATE;
+import cn.iever.wxh.yjserver.core.model.STATUS;
+import cn.iever.wxh.yjserver.core.msg.AbstractMessage;
+import cn.iever.wxh.yjserver.core.msg.ClientLoginMessage;
+import cn.iever.wxh.yjserver.core.msg.ClientLoginMessageNew;
+import cn.iever.wxh.yjserver.core.msg.MonitorMessage;
+import cn.iever.wxh.yjserver.core.msg.QuerMessage;
+import cn.iever.wxh.yjserver.core.msg.TransferedMessage;
+
+/**
+ * 服务器会话交流处理  
+ * 
+ * V2.0
+ * 
+ * @author wuxuehong
+ *
+ */
+public class CommunicateService {
+	
+	public static Logger logger = Logger.getLogger(CommunicateService.class);
+	
+	private IDeviceServiceAPI deviceService;
+	
+	public CommunicateService(IDeviceServiceAPI deviceService){
+		this.deviceService = deviceService;
+	}
+	
+	/**
+	 * 当前会话有效性标识  存放于session对象中   @IoSession.setAttribute
+	 */
+	public static final String AUTHORIZATION = "authorization"; 
+	
+	/**
+	 * 服务器上所有客户端需要进行中转的客户端会话 保存在该容器中
+	 * @key  String,   网关ID， 每一台网关系统的唯一标识
+	 * @value List   用于保存响应的网关系统下，当前与之进行通信的客户端会话列表
+	 * 
+	 */
+	private Map<String, List<IoSession>>  clientMap = new HashMap<String, List<IoSession>>();
+	
+	/**
+	 * 所有与服务器建立长连接的会话信息存放在该容器中
+	 * @key  String: 设备ID
+	 * @value IoSession: 网关会话
+	 */
+	private Map<String, IoSession>  gateWayMap = new HashMap<String, IoSession>();
+	
+	
+	/**
+	 * 该会话是用于收集服务器当前内部数据信息
+	 */
+	 private List<IoSession>  monitorSessions = new ArrayList<IoSession>();
+	 
+	/**
+	 * 反馈客户端数
+	 * @param addorRemove   新增0x01/移除0x00
+	 * @param sessionId  会话编号
+	 * @param num         当前客户端数
+	 * @param deviceId   设备ID
+	 */
+	private void responseClientNum(byte addorRemove, byte sessionId, byte  num,   String deviceId){
+		IoSession session = gateWayMap.get(deviceId);
+		if(session != null && session.isConnected()){
+			TransferedMessage msg = new TransferedMessage();
+			msg.setRealRequestType((byte)0xcc);
+			byte[] data = new byte[]{addorRemove,sessionId,num};
+			msg.setData(data);
+			session.write(msg);
+		}
+	}
+	
+	/**
+	 * 保存新的会话
+	 * @param session
+	 */
+	private void newClient(IoSession session, String deviceId){
+		synchronized (clientMap) {
+			List<IoSession> list = clientMap.get(deviceId);
+			  if(list == null){
+				  list = new ArrayList<IoSession>();
+				  list.add(session);
+				  clientMap.put(deviceId, list);
+			  }else{
+				  if(!list.contains(session)){
+					  list.add(session);
+				  }
+			  }
+		}
+		logger.info("New client session:"+session);
+	}
+	
+	/**
+	 * 获取当前会话随机编号
+	 * 客户端会话随机编号自定义为1-127
+	 * @param deviceId
+	 * @return
+	 */
+	private int getRandomSessionKey(String deviceId){
+		Random r = new Random();
+		int value = -1;
+		while(true){
+			value = r.nextInt(127)+1;
+			synchronized (clientMap) {
+				List<IoSession> sessions = clientMap.get(deviceId);
+				if(sessions != null){
+					//防止客户端会话过多时  进入死循环
+					if(sessions.size() > 125) break;
+					for(int i=0;i<sessions.size();i++){
+						Authorization auth = (Authorization) sessions.get(i).getAttribute(AUTHORIZATION);
+						if(auth != null){
+							  if(auth.getSessionID() == value && value != -1) continue;
+						}
+					}
+				}
+			}
+			break;
+		}
+		return value;
+	}
+	
+	/**
+	 * 判断当前连接有没授权
+	 * @param session
+	 * @return
+	 */
+	private boolean isAuthorization(IoSession session){
+		return session.getAttribute(AUTHORIZATION)!=null?true:false;
+	}
+	
+	/**
+	 * turn bytes array to string
+	 * @param buf
+	 * @param offset
+	 * @param length
+	 * @return
+	 */
+	@SuppressWarnings("unused")
+	private String bytesToHexString(byte[] buf, int offset, int length) {
+		StringBuffer sb = new StringBuffer("");
+		if (buf == null || buf.length <= 0)
+			return "";
+		for (int i = offset; i < length+offset; i++) {
+			int v = buf[i] & 0xFF;// 
+			String hv = Integer.toHexString(v);
+			if (hv.length() < 2) {
+				sb.append("0");
+			}
+			sb.append(hv);
+		}
+		return sb.toString();
+	}
+	
+	/**
+	 * 新增客户端会话
+	 * 老版本：标记有效身份，添加到客户端会话列表
+	 * @param session
+	 * @param device
+	 */
+	public void newClientSession(IoSession session, DeviceVo device){
+		//标记有效身份
+		Authorization auth =  new Authorization(STATUS.CLIENT, device.getDeviceId(),device.getUserId());
+		auth.setUserName(device.getUserId());
+		session.setAttribute(CommunicateService.AUTHORIZATION,auth);
+		//添加到客户端列表
+		newClient(session, device.getDeviceId());
+	}
+	
+	/**
+	 * 新增客户端会话    处理
+	 * 新版本： 委托服务器转发客户端登录信息， 标记会话身份信息  ，  添加到客户端会话列表
+	 * @param session          客户端会话
+	 * @param device            网关设备信息
+	 * @param userName     账户名
+	 * @param userPwd       账户密码
+	 */
+	public void newClientSessionNew(IoSession session, DeviceVo device, String userName, String userPwd){
+		
+		/**
+		 * 根据用户名和密码构建登录包
+		 */
+		byte[] data,names,pwds;
+		try {
+			names = userName.getBytes("utf-8");
+			pwds = userPwd.getBytes("utf-8");
+			//(1byte)用户名长度+(mbytes)用户名+(1byte)密码长度+(nbytes)密码
+			data = new byte[2+names.length+pwds.length];
+		} catch (UnsupportedEncodingException e) {
+			e.printStackTrace();
+			return;
+		}
+		data[0] = (byte) names.length;
+		System.arraycopy(names, 0, data, 1, names.length);
+		data[1+names.length] = (byte) pwds.length;
+		System.arraycopy(pwds, 0, data, 2+names.length, pwds.length);
+		
+		//创建包实例(由服务器帮助客户端转发登录包到网关系统)
+		TransferedMessage msg = new TransferedMessage();
+		msg.setRealRequestType(AbstractMessage.CLIENT_REQ_LOGIN);
+		msg.setData(data);
+		
+		/**
+		 * 标记会话身份信息
+		 */
+		int sessionId = getRandomSessionKey(device.getDeviceId());
+		logger.info("get random session id:["+sessionId+"]");
+		msg.setAttachData((byte)sessionId);
+		Authorization auth = new Authorization(STATUS.NEWCLIENT, device.getDeviceId(),device.getUserId(),sessionId);
+		auth.setUserName(userName);
+		auth.setUserPwd(userPwd);
+		session.setAttribute(CommunicateService.AUTHORIZATION, auth);
+		
+		/**
+		 * 由服务器中转发送登陆请求消息
+		 */
+		IoSession s = gateWayMap.get(device.getDeviceId());
+		if(s != null){
+			//使用网关会话进行消息转发
+			s.write(msg);
+			logger.info("["+device.getUserId()+"-"+userName+"] Server agent is login ing....");
+			//processStateMessage("客户端请求服务器:["+device.getUserId()+"-"+userName+"]-[代理登陆...]");
+			/**
+			 * 添加到客户端列表 
+			 * @TODO  是否会成为死记录 一直存在于内存中，造成内存泄露呢？ 
+			 * 确保该会话能够消除！
+			 */
+			newClient(session, device.getDeviceId());
+		}else{
+			//如果网关不在线 则通知所有客户端
+			 ClientLoginMessageNew crm = new ClientLoginMessageNew();
+			 crm.setIp(new byte[]{0x00,0x00,0x00,0x00});
+			 crm.setResult(AbstractMessage.CLIENT_RESP_DISCONNECT);
+			 List<IoSession> list = clientMap.get(device.getDeviceId());
+				if(list != null)
+					for(int i=0;i<list.size();i++){
+						list.get(i).write(crm);
+						//TODO  是否要强制关闭客户端连接
+					}
+		}
+	}
+	
+	
+	/**
+	 * 新增网关会话
+	 * @param session
+	 * @param device
+	 */
+	public void newGatewaySession(IoSession session, DeviceVo device){
+		synchronized (gateWayMap) {
+			//设置有效会话标识
+			session.setAttribute(AUTHORIZATION, new Authorization(STATUS.GATWAY, device.getDeviceId(),device.getUserId()));
+			synchronized (gateWayMap) {
+				String key = device.getDeviceId();
+				gateWayMap.put(key, session);
+			}
+		}
+	}
+	
+	/**
+	 * 新的服务器监控会话
+	 * @param session
+	 */
+	public void newMonitorSession(IoSession session){
+		 synchronized (monitorSessions) {
+			 session.setAttribute(CommunicateService.AUTHORIZATION,new Authorization(STATUS.MONITOR,"UNKNOWN","UNKNOWN"));
+			 if(!monitorSessions.contains(session))
+				 monitorSessions.add(session);
+		}
+	}
+	
+	/**
+	 * 移除会话
+	 * @param session
+	 */
+	public void removeSession(IoSession session){
+		Object obj = session.getAttribute(AUTHORIZATION);
+		if(obj == null) {
+			return;
+		}
+		Authorization auth = (Authorization)obj;
+		STATUS status = auth.getStatus();
+		String key = auth.getDeviceId();
+		switch (status) {
+		case  CLIENT:
+		case NEWCLIENT:
+			int  num = 0;
+			synchronized (clientMap) {
+				List<IoSession> list = clientMap.get(key);
+				if(list != null){
+					list.remove(session);
+					num = list.size();
+				}
+			}
+			//TODO 反馈客户端连接数   移除客户端
+			responseClientNum((byte)0x00,(byte)auth.getSessionID(),(byte)num, key);
+			logger.info("Remove client session:["+auth.getHostName()+"]");
+			processMonitorMessage("客户端长连接断开:["+auth.getHostName()+"]");
+			break;
+		case GATWAY:
+			synchronized (gateWayMap) { 
+				Iterator<String> it = gateWayMap.keySet().iterator();
+				String value;
+				IoSession s;
+				while(it.hasNext()){
+					value = it.next();
+					s = gateWayMap.get(value);
+					if(value.equals(key)&&s != null && s.equals(session)){
+						gateWayMap.remove(key);
+						logger.info("Remove gateway session:["+auth.getHostName()+"]last:"+gateWayMap.size());
+						processMonitorMessage("网关长连接断开:["+auth.getHostName()+"]剩余["+gateWayMap.size()+"]");
+						break;
+					}
+				}
+			}
+			break;
+		case MONITOR:
+			synchronized (monitorSessions) {
+				monitorSessions.remove(session);
+			}
+			break;
+		default:
+			logger.info("Unknown removed session!");
+			break;
+		}
+	}
+	
+	 /**
+	  * 处理查询命令
+	  * @param session
+	  * @param query
+	  */
+	 public void processQueryMessage(IoSession session, QuerMessage msg){
+		 String query = msg.getQueryMsg();
+		 if(query == null) return;
+		 Scanner s;
+		 if(query.startsWith("ls")){
+			 	s = new Scanner(query);
+			 	s.next();
+			 	if(s.hasNext()){
+			 		DeviceVo device = null;
+			 		String id = s.next();
+					device = deviceService.queryDeviceByUserId(id);
+					if (device != null) {
+						msg.setQueryMsg("设备信息:"+device.toQueryString());
+					} else
+						msg.setQueryMsg("["+id+"]设备不存在！");
+					session.write(msg);
+					return;
+			 	}
+		 }else if(query.equals("count online")){
+			 try{
+				int num =  deviceService.countByState(STATE.ON);
+				msg.setQueryMsg("当日已上线网关数:"+num);
+			 }catch (Exception e) {
+				msg.setQueryMsg(e.getMessage());
+			}
+			 session.write(msg);
+			 return;
+		 }else if(query.equals("count gateway")){
+			 int num = getConnectedGateway();
+			 msg.setQueryMsg("当前与服务器建立长连接网关数:"+num);
+			 session.write(msg);
+			 return;
+		 }else if(query.equals("count client")){
+			 int num = getConnectedClients();
+			 msg.setQueryMsg("当前与服务器建立长连接客户端数:"+num);
+			 session.write(msg);
+			 return;
+		 }else if(query.equals("login")){
+			 newMonitorSession(session);
+			 logger.info("New monitor session:"+session);
+			 return;
+		 }else if("exit".equals(query)){
+			 session.close(true);
+			 return;
+		 }
+		 msg.setQueryMsg("未知命令!");
+		 session.write(msg);
+	 }
+	 
+	 /**
+	  * 处理服务器实时信息
+	  * @param query
+	  */
+	 public void processMonitorMessage(String query){
+		 MonitorMessage msg = new MonitorMessage();
+		 msg.setMonitor(query);
+		synchronized (monitorSessions) {
+			for(int i=0;i<monitorSessions.size();i++){
+				monitorSessions.get(i).write(msg);
+			}
+		}
+	 }
+	
+	/**
+	 * 处理客户端与网关间的数据通信
+	 * @param session   
+	 * @param msg
+	 */
+	public void processData(IoSession session, TransferedMessage msg){
+		Object obj = session.getAttribute(AUTHORIZATION);
+		if(obj == null) {
+			//logger.warn("Unknown session![processData]");
+			return;
+		}
+		
+		Authorization auth = (Authorization)obj;
+		STATUS status = auth.getStatus();
+		String key = auth.getDeviceId();
+	
+//	System.out.println("status:"+status);
+		switch (status) {
+		case NEWCLIENT:  //客户端目前处于待验证状态  如果此时该会话发送请求消息则忽略
+			logger.warn("NEWCLIENT no actison...");
+			break;
+		case CLIENT:
+			IoSession ss = gateWayMap.get(key);
+			//如果网关会话在线
+			if(ss != null && isAuthorization(ss)){
+				//使用网关会话进行消息转发
+				msg.setAttachData((byte)auth.getSessionID());
+				ss.write(msg);
+			}else{
+				//如果网关不在线 则通知所有客户端
+				 ClientLoginMessage crm = new ClientLoginMessage();
+				 crm.setIp(new byte[]{0x00,0x00,0x00,0x00});
+				 crm.setResult(AbstractMessage.CLIENT_RESP_DISCONNECT);
+				 List<IoSession> list = clientMap.get(key);
+					if(list != null)
+						for(int i=0;i<list.size();i++){
+							list.get(i).write(crm);
+							//TODO  是否要强制关闭客户端连接
+						}
+			}
+			break;
+		case GATWAY:
+			//如果网关会话中反馈包的请求类型是登陆
+			//则表示是网关转发的客户端登陆请求消息的反馈
+			//反馈结果(1byte)会话ID+(1byte)角色ID+(1byte)登陆结果
+			if(msg.getRealRequestType() == AbstractMessage.CLIENT_REQ_LOGIN){
+				  if(msg.getData()!= null && msg.getData().length==(3)){
+					   //客户端会话ID
+					   int sessionId = msg.getData()[0]&0xff;
+					   //客户端角色信息
+					   byte role = msg.getData()[1];
+					   //登陆结果
+					   byte result = msg.getData()[2];
+					   //从当前系统中的客户端会话中寻找该反馈所对应的客户端会话
+					   synchronized (clientMap) {
+						   //根据设备ID信息 获取到对应的客户端会话集合
+						   List<IoSession> sessions = clientMap.get(key);
+						   if(sessions != null){
+							   for(int i=0;i<sessions.size();i++){
+								   IoSession s = sessions.get(i);
+								   Authorization a = (Authorization) s.getAttribute(AUTHORIZATION);
+								   if(a != null){
+									      //根据客户端会话ID  寻找到相应的会话信息
+									     if(a.getSessionID() == sessionId){
+									    	 //创建反馈消息实例
+									    	 ClientLoginMessageNew resp = new ClientLoginMessageNew();
+									    	 resp.setRole(role);
+									    	 resp.setResult(result);
+									    	 resp.setIp(((InetSocketAddress)session.getRemoteAddress()).getAddress().getAddress());
+									    	  //如果登陆成功
+									    	  if(result == (byte)0xd1){
+									    		  //转换客户端 会话身份 ，有效身份验证
+									    		  //标识当前可以自由发送转发消息了
+									    		    a.setStatus(STATUS.CLIENT);
+									    		    logger.info("["+a.getHostName()+"-"+a.getUserName()+"]Server agent is logined");
+									    		  //  processStateMessage("客户端请求服务器:["+a.getHostName()+"-"+a.getUserName()+"]-[代理登陆成功]");
+									    		  //TODO 反馈客户端连接数   新增客户端
+									    			responseClientNum((byte)0x01, (byte)sessionId, (byte)sessions.size(), key);
+									    	  }
+									    	  //将登陆结果反馈到客户端
+									    	 s.write(resp);
+									    	 break;
+									     }
+								   }
+							   }
+						   }
+					   }
+				  }
+			}else if(msg.getRealRequestType() == AbstractMessage.CLIENT_ONE_ONE){  //需要一对一处理的消息
+				//(1byte)真实反馈类型+(mbytes)反馈数据+(1bytes)会话编号
+				byte type = msg.getData()[0];
+				int sessionID = msg.getData()[msg.getData().length-1]&0xff;
+				 List<IoSession> sessions = clientMap.get(key);
+				   if(sessions != null){
+					   for(int i=0;i<sessions.size();i++){
+						   IoSession s = sessions.get(i);
+						   Authorization a = (Authorization) s.getAttribute(AUTHORIZATION);
+						   if(a != null){
+							      //根据客户端会话ID  寻找到相应的会话信息
+							     if(a.getSessionID() == sessionID){
+							    	 msg.setRealRequestType(type);
+							    	 msg.setData(Arrays.copyOfRange(msg.getData(), 1,msg.getData().length-1));
+							    	 s.write(msg);
+							    	 break;
+							     }
+						   }
+					   }
+				   }
+			}else{   //如果是其他反馈消息  则反馈给所有的 身份为CLIENT的客户端
+				List<IoSession> list = clientMap.get(key);
+				if(list != null)
+					for(int i=0;i<list.size();i++){
+						IoSession s = list.get(i);
+						Authorization a = (Authorization) s.getAttribute(AUTHORIZATION);
+						if(a != null && a.getStatus() == STATUS.CLIENT)
+							s.write(msg);
+					}
+			}
+			break;
+		default:
+			break;
+		}
+	}
+	
+	/**
+	 * 根据设备ID 判断 当前网关与服务器的会话是否存在
+	 * @param devid
+	 * @return
+	 */
+	public boolean isGateWayExist(String devid){
+		return gateWayMap.get(devid)!=null?true:false;
+	}
+
+	/**
+	 * 查看当前网关连接数
+	 * 
+	 * @return
+	 */
+	public int getConnectedGateway(){
+		return gateWayMap.size();
+	}
+	
+	/**
+	 * 查看当前客户端连接数
+	 * @return
+	 */
+	public int getConnectedClients(){ 
+		return clientMap.size();
+	}
+	
+	/**
+	 * 显示详细的长连接网关信息
+	 */
+	public void detailGateway(){
+		System.out.println("============detail gateway================");
+		synchronized (gateWayMap) {
+			Iterator<IoSession> it = gateWayMap.values().iterator();
+			IoSession s;
+			Object obj;
+			Authorization auth;
+			while(it.hasNext()){
+				s = it.next();
+				obj = s.getAttribute(AUTHORIZATION);
+				if(obj != null){
+					auth = (Authorization)obj;
+					System.out.println(auth.getHostName()+"\t"+auth.getDeviceId());
+				}
+			}
+		}
+	}
+	
+	/**
+	 * 显示详细的长连接客户端信息
+	 */
+	public void detailClient(){
+		System.out.println("============detail client================");
+		synchronized (clientMap) {
+			Iterator<List<IoSession>> it = clientMap.values().iterator();
+			List<IoSession> list;
+			IoSession s;
+			Object obj;
+			Authorization auth;
+			while(it.hasNext()){
+				list = it.next();
+				if(list!=null && list.size()!=0){
+					s = list.get(0);
+					obj = s.getAttribute(AUTHORIZATION);
+					if(obj != null){
+						auth = (Authorization)obj;
+						System.out.println(auth.getHostName()+"\t"+auth.getDeviceId());
+					}
+				}
+			}
+		}
+	}
+	
+}
